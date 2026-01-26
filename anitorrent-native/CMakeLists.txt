@@ -53,7 +53,7 @@ else ()
 	# 尝试引入 GNU/Linux 发行版下的编译
     if (UNIX AND NOT APPLE AND NOT WIN32)
         # 添加 Linux 平台下的额外配置
-		add_compile_options(-Wall -Wextra -std=c++17 -g -O2 -pthread -fPIC -fno-exceptions -frtti)
+		add_compile_options(-Wall -Wextra -std=c++17 -O2 -pthread -fPIC -fno-exceptions -frtti)
 		set(BUILD_SHARED_LIBS OFF) # 编译 libtorrent 为静态库
 		set(OPENSSL_USE_STATIC_LIBS TRUE) # 静态链接 OpenSSL
         find_package(OpenSSL REQUIRED)
