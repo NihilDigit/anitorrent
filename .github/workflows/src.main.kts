@@ -12,7 +12,7 @@
 // 也可以在 IDE 里右键 Run
 
 @file:CompilerOptions("-Xmulti-dollar-interpolation", "-Xdont-warn-on-error-suppression")
-@file:Suppress("UNSUPPORTED_FEATURE", "UNSUPPORTED")
+@file:Suppress("UNSUPPORTED_FEATURE", "UNSUPPORTED", "UNSUPPORTED_ARRAY_LITERAL_OUTSIDE_OF_ANNOTATION")
 
 @file:Repository("https://repo.maven.apache.org/maven2/")
 @file:DependsOn("io.github.typesafegithub:github-workflows-kt:3.0.1")
@@ -54,8 +54,10 @@ import io.github.typesafegithub.workflows.domain.JobOutputs
 import io.github.typesafegithub.workflows.domain.Mode
 import io.github.typesafegithub.workflows.domain.Permission
 import io.github.typesafegithub.workflows.domain.RunnerType
+import io.github.typesafegithub.workflows.domain.actions.CustomAction
 import io.github.typesafegithub.workflows.domain.triggers.PullRequest
 import io.github.typesafegithub.workflows.domain.triggers.Push
+import io.github.typesafegithub.workflows.domain.triggers.WorkflowDispatch
 import io.github.typesafegithub.workflows.dsl.JobBuilder
 import io.github.typesafegithub.workflows.dsl.expressions.contexts.GitHubContext
 import io.github.typesafegithub.workflows.dsl.expressions.contexts.SecretsContext
@@ -196,7 +198,8 @@ class MatrixInstance(
 
         if (os == OS.WINDOWS) {
             add(quote("-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake"))
-            add(quote("-DBoost_INCLUDE_DIR=C:/vcpkg/installed/x64-windows/include"))
+            val boostTriplet = if (arch == Arch.AARCH64) "arm64-windows" else "x64-windows"
+            add(quote("-DBoost_INCLUDE_DIR=C:/vcpkg/installed/$boostTriplet/include"))
         }
 
         add(quote("-Dorg.gradle.jvmargs=-Xmx${gradleHeap}"))
@@ -263,6 +266,14 @@ sealed class Runner(
         os = OS.WINDOWS,
         arch = Arch.X64,
         labels = setOf("windows-2022"),
+    )
+
+    object GithubWindows11Arm64 : GithubHosted(
+        id = "github-windows-11-arm64",
+        displayName = "Windows 11 AArch64 (GitHub)",
+        os = OS.WINDOWS,
+        arch = Arch.AARCH64,
+        labels = setOf("windows-11-arm"),
     )
 
     object GithubMacOS13 : GithubHosted(
@@ -359,6 +370,23 @@ val buildMatrixInstances = listOf(
         buildAllAndroidAbis = false,
     ),
     MatrixInstance(
+        runner = Runner.GithubWindows11Arm64,
+        uploadApk = false,
+        buildAnitorrent = true,
+        buildAnitorrentSeparately = false,
+        composeResourceTriple = "windows-arm64",
+        gradleHeap = "4g",
+        kotlinCompilerHeap = "4g",
+        gradleParallel = true,
+        uploadDesktopInstallers = true,
+        extraGradleArgs = listOf(
+            "-P$ANI_ANDROID_ABIS=arm64-v8a",
+        ),
+        buildAllAndroidAbis = false,
+        // WOA64 orchestration harness: this dispatch only needs the native runtime artifact.
+        runTests = false,
+    ),
+    MatrixInstance(
         runner = Runner.GithubUbuntu2404,
         name = "Ubuntu 24.04 LTS x86_64",
         uploadApk = false,
@@ -410,6 +438,7 @@ fun getBuildJobBody(matrix: MatrixInstance): JobBuilder<BuildJobOutputs>.() -> U
     with(WithMatrix(matrix)) {
         freeSpace()
         installJdk()
+        setupAndroidSdkForOrchestration()
         installNativeDeps()
         chmod777()
         setupGradle()
@@ -417,7 +446,7 @@ fun getBuildJobBody(matrix: MatrixInstance): JobBuilder<BuildJobOutputs>.() -> U
         gradleCheck()
         runGradle(
             name = "Build anitorrent",
-            tasks = ["buildAnitorrent", "copyNativeJarForCurrentPlatform"],
+            tasks = arrayOf("buildAnitorrent", "copyNativeJarForCurrentPlatform"),
         )
         uploadAnitorrent()
 
@@ -437,6 +466,8 @@ workflow(
         // - pushing to a branch that has an associated PR
         Push(pathsIgnore = listOf("**/*.md")),
         PullRequest(pathsIgnore = listOf("**/*macosDmg.md")),
+        // WOA64 orchestration harness: temporary manual trigger for the meta repository.
+        WorkflowDispatch(),
     ),
     sourceFile = __FILE__,
     targetFileName = "build.yml",
@@ -451,12 +482,17 @@ workflow(
             permissions = mapOf(
                 Permission.Actions to Mode.Write, // Upload artifacts
             ),
-            `if` = if (matrix.selfHosted) {
-                // For self-hosted runners, only run if it's our main repository (not a fork).
-                // For security concerns, all external contributors will need approval to run the workflow.
-                expr { github.isAnimekoRepository }
-            } else {
-                null // always
+            `if` = when {
+                matrix.selfHosted -> {
+                    // For self-hosted runners, only run if it's our main repository (not a fork).
+                    // For security concerns, all external contributors will need approval to run the workflow.
+                    expr { github.isAnimekoRepository and github.event_name.neq("workflow_dispatch") }
+                }
+
+                matrix.isWindowsAArch64 -> null
+
+                // WOA64 orchestration harness: manual dispatch only exercises the Windows ARM64 job.
+                else -> expr { github.event_name.neq("workflow_dispatch") }
             },
             outputs = BuildJobOutputs(),
             block = getBuildJobBody(matrix),
@@ -563,7 +599,7 @@ workflow(
 
                 runGradle(
                     name = "Update Release Version Name",
-                    tasks = ["updateReleaseVersionNameFromGit"],
+                    tasks = arrayOf("updateReleaseVersionNameFromGit"),
                     env = mapOf(
                         "GITHUB_TOKEN" to expr { secrets.GITHUB_TOKEN },
                         "GITHUB_REPOSITORY" to expr { secrets.GITHUB_REPOSITORY },
@@ -575,7 +611,7 @@ workflow(
 
                 runGradle(
                     name = "Build anitorrent",
-                    tasks = ["buildAnitorrent", "copyNativeJarForCurrentPlatform"],
+                    tasks = arrayOf("buildAnitorrent", "copyNativeJarForCurrentPlatform"),
                 )
                 // no check
                 uploadAnitorrent()
@@ -607,7 +643,7 @@ workflow(
 
             run(command = "ls -l anitorrent-native/build/native-jars")
             runGradle(
-                tasks = ["publish"],
+                tasks = arrayOf("publish"),
                 env = mapOf(
                     "ORG_GRADLE_PROJECT_mavenCentralUsername" to expr { secrets["ORG_GRADLE_PROJECT_mavenCentralUsername"]!! },
                     "ORG_GRADLE_PROJECT_mavenCentralPassword" to expr { secrets["ORG_GRADLE_PROJECT_mavenCentralPassword"]!! },
@@ -735,6 +771,33 @@ class WithMatrix(
         }
     }
 
+    fun JobBuilder<*>.setupAndroidSdkForOrchestration() {
+        if (matrix.isWindowsAArch64) {
+            // WOA64 orchestration harness: windows-11-arm does not provide ANDROID_HOME.
+            uses(
+                name = "Setup Android SDK",
+                action = CustomAction(
+                    actionOwner = "android-actions",
+                    actionName = "setup-android",
+                    actionVersion = "v3",
+                    inputs = mapOf(
+                        "accept-android-sdk-licenses" to "false",
+                        "packages" to "platform-tools",
+                    ),
+                ),
+            )
+            run(
+                name = "Install Android platform",
+                command = shell(
+                    """
+                    1..20 | ForEach-Object { "y" } | sdkmanager --licenses
+                    sdkmanager "platforms;android-34"
+                    """.trimIndent(),
+                ),
+            )
+        }
+    }
+
     fun JobBuilder<*>.chmod777() {
         if (matrix.isUnix) {
             run(
@@ -777,7 +840,12 @@ class WithMatrix(
         return uses(
             name = "Upload Anitorrent",
             action = UploadArtifact(
-                name = ArtifactNames.anitorrentNativeJar(matrix.os, matrix.arch),
+                name = if (matrix.isWindowsAArch64) {
+                    // WOA64 orchestration harness: keep this name aligned with animeko-woa64.
+                    "anitorrent-windows-arm64"
+                } else {
+                    ArtifactNames.anitorrentNativeJar(matrix.os, matrix.arch)
+                },
                 path_Untyped = "anitorrent-native/build/native-jars/anitorrent-native-*.jar",
                 overwrite = true,
                 ifNoFilesFound = UploadArtifact.BehaviorIfNoFilesFound.Error,
@@ -821,6 +889,7 @@ val MatrixInstance.isUnix get() = (os == OS.UBUNTU) or (os == (OS.MACOS))
 
 val MatrixInstance.isMacOSAArch64 get() = (os == OS.MACOS) and (arch == Arch.AARCH64)
 val MatrixInstance.isMacOSX64 get() = (os == OS.MACOS) and (arch == Arch.X64)
+val MatrixInstance.isWindowsAArch64 get() = (os == OS.WINDOWS) and (arch == Arch.AARCH64)
 
 // only for highlighting (though this does not work in KT 2.1.0)
 fun shell(@Language("shell") command: String) = command
